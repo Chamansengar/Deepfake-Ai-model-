@@ -1,0 +1,9 @@
+torch
+torchvision
+facenet-pytorch
+grad-cam
+gradio
+numpy
+Pillow
+opencv-python
+scikit-learn
