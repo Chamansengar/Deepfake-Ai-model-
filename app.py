@@ -10,6 +10,7 @@ import os
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
+from temporal_model import TemporalDeepfakeModel, load_temporal_model
 
 # ============================================================
 # 1. Initialize Device (Use GPU if available)
@@ -63,6 +64,36 @@ else:
     print("  Run 'python train.py --train_dir ./data/train --val_dir ./data/val' to fine-tune.")
 
 resnet.eval()  # Set model to evaluation mode
+
+# ============================================================
+# 3b. Initialize Temporal Model (if checkpoint exists)
+# ============================================================
+TEMPORAL_CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), 'checkpoints', 'best_temporal_model.pth')
+temporal_model = None
+temporal_seq_len = 16  # default
+
+if os.path.isfile(TEMPORAL_CHECKPOINT_PATH):
+    print(f"Loading temporal model checkpoint: {TEMPORAL_CHECKPOINT_PATH}")
+    try:
+        # Peek at checkpoint to get config
+        _ckpt = torch.load(TEMPORAL_CHECKPOINT_PATH, map_location=device, weights_only=True)
+        _temporal_head = _ckpt.get('temporal_head', 'transformer')
+        temporal_seq_len = _ckpt.get('seq_len', 16)
+
+        temporal_model = load_temporal_model(
+            checkpoint_path=TEMPORAL_CHECKPOINT_PATH,
+            temporal_head=_temporal_head,
+            device=device,
+            seq_len=temporal_seq_len,
+        )
+        temporal_model.to(device)
+        print(f"  Temporal model ready (head={_temporal_head}, seq_len={temporal_seq_len})")
+    except Exception as e:
+        print(f"WARNING: Failed to load temporal model: {e}")
+        temporal_model = None
+else:
+    print(f"No temporal model found at '{TEMPORAL_CHECKPOINT_PATH}'.")
+    print("  Run 'python train_video.py' to train the temporal model.")
 
 # ============================================================
 # 4. Pre-instantiate GradCAM ONCE (was re-created per call before)
@@ -343,6 +374,187 @@ def predict_video(input_video, frame_skip=5, threshold=0.5, use_tta=False):
 
 
 # ============================================================
+# 6b. Temporal Video Prediction
+# ============================================================
+def predict_video_temporal(input_video, threshold=0.5, seq_len=16):
+    """
+    Process a video using the temporal model for deepfake detection.
+
+    Extracts a sequence of face frames, passes them through the
+    InceptionResnetV1 + Transformer/LSTM temporal model for a
+    single video-level prediction.
+
+    Args:
+        input_video: Path to the uploaded video file.
+        threshold:   Decision boundary for real/fake classification.
+        seq_len:     Number of frames to sample from the video.
+
+    Returns:
+        (summary_text, annotated_video_path)
+    """
+    if input_video is None:
+        return "Error: No video provided.", None
+
+    if temporal_model is None:
+        return (
+            "Error: Temporal model not available.\n"
+            "Train it first: python train_video.py --train_dir ./data/video_frames/train "
+            "--val_dir ./data/video_frames/val"
+        ), None
+
+    cap = cv2.VideoCapture(input_video)
+    if not cap.isOpened():
+        return "Error: Could not open video file.", None
+
+    # Video properties
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if total_frames <= 0:
+        cap.release()
+        return "Error: Could not read video frames.", None
+
+    # Sample frame indices evenly across the video
+    if total_frames <= seq_len:
+        frame_indices = list(range(total_frames))
+    else:
+        start = max(1, int(total_frames * 0.02))
+        end = min(total_frames - 1, int(total_frames * 0.98))
+        if end <= start:
+            start, end = 0, total_frames - 1
+        frame_indices = np.linspace(start, end, num=seq_len, dtype=int).tolist()
+
+    # Extract face frames
+    face_frames = []
+    face_boxes_per_frame = {}  # For annotation
+    original_frames = {}  # Store original frames for annotation
+
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(frame_rgb)
+        img_pil_resized, scale = cap_image_size(img_pil)
+
+        # Detect face
+        face = mtcnn(img_pil_resized)
+        if face is not None:
+            # Resize face to 256x256
+            face_resized = F.interpolate(
+                face.unsqueeze(0), size=(256, 256),
+                mode='bilinear', align_corners=False
+            ).squeeze(0)
+
+            # Normalize from [0, 255] to [-1, 1]
+            face_normalized = (face_resized - 127.5) / 128.0
+            face_frames.append(face_normalized)
+
+            # Detect bounding boxes for annotation
+            boxes, _ = mtcnn_detect.detect(img_pil_resized)
+            if boxes is not None:
+                face_boxes_per_frame[idx] = (boxes, scale)
+            original_frames[idx] = frame.copy()
+
+    cap.release()
+
+    if len(face_frames) == 0:
+        return "Error: No faces detected in any sampled frame.", None
+
+    # Pad or truncate to seq_len
+    while len(face_frames) < seq_len:
+        face_frames.append(face_frames[len(face_frames) % len(face_frames)])
+    face_frames = face_frames[:seq_len]
+
+    # Stack into batch: (1, seq_len, 3, 256, 256)
+    frames_tensor = torch.stack(face_frames, dim=0).unsqueeze(0).to(device)
+
+    # Predict
+    with torch.no_grad():
+        logits = temporal_model(frames_tensor).squeeze()
+        pred_value = torch.sigmoid(logits).item()
+
+    if pred_value < threshold:
+        label = "Real"
+        confidence = (1 - pred_value) * 100
+    else:
+        label = "Fake"
+        confidence = pred_value * 100
+
+    # Create annotated output video
+    cap = cv2.VideoCapture(input_video)
+    output_path = os.path.join(tempfile.mkdtemp(), "temporal_output.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    color = (0, 0, 255) if label == "Fake" else (0, 255, 0)
+    text = f"Temporal: {label} {confidence:.1f}%"
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Draw label on every frame
+        cv2.putText(frame, text, (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+
+        # Draw face boxes if available for nearby analyzed frames
+        nearest_analyzed = min(face_boxes_per_frame.keys(), key=lambda x: abs(x - frame_idx),
+                               default=None) if face_boxes_per_frame else None
+        if nearest_analyzed is not None and abs(nearest_analyzed - frame_idx) < fps:
+            boxes, scale = face_boxes_per_frame[nearest_analyzed]
+            for box in boxes:
+                x1, y1, x2, y2 = [int(coord / scale) for coord in box]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width - 1, x2), min(height - 1, y2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        out.write(frame)
+        frame_idx += 1
+
+    cap.release()
+    out.release()
+
+    # Summary
+    temporal_status = "Transformer" if temporal_model is not None else "N/A"
+    checkpoint_info = os.path.isfile(TEMPORAL_CHECKPOINT_PATH)
+
+    summary = (
+        f"Temporal Video Analysis Complete\n"
+        f"{'=' * 40}\n"
+        f"Model: Temporal ({temporal_status})\n"
+        f"Frames sampled: {len(frame_indices)} (of {total_frames} total)\n"
+        f"Faces detected: {sum(1 for _ in face_boxes_per_frame)}\n"
+        f"{'=' * 40}\n"
+        f"Prediction: {label}\n"
+        f"Confidence: {confidence:.1f}%\n"
+        f"{'=' * 40}\n"
+        f"Threshold: {threshold} | Sequence length: {seq_len}"
+    )
+
+    return summary, output_path
+
+
+# ============================================================
+# 6c. Video Prediction Router
+# ============================================================
+def predict_video_router(input_video, frame_skip=5, threshold=0.5, use_tta=False, use_temporal=False):
+    """
+    Routes video prediction to either frame-by-frame or temporal model.
+    """
+    if use_temporal:
+        return predict_video_temporal(input_video, threshold=threshold, seq_len=temporal_seq_len)
+    else:
+        return predict_video(input_video, frame_skip=frame_skip, threshold=threshold, use_tta=use_tta)
+
+
+# ============================================================
 # 7. Build the Gradio Interface with Tabs
 # ============================================================
 with gr.Blocks(
@@ -388,10 +600,20 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column():
                     vid_input = gr.Video(label="Upload Video", format="mp4")
+                    vid_temporal = gr.Checkbox(
+                        value=temporal_model is not None,
+                        label="Use Temporal Model (sequence analysis)",
+                        info=(
+                            "Analyzes temporal patterns across frames using Transformer. "
+                            + ("✓ Model loaded" if temporal_model is not None else "⚠ Not available — train with train_video.py")
+                        ),
+                        interactive=temporal_model is not None,
+                    )
                     vid_skip = gr.Slider(
                         minimum=1, maximum=30, value=5, step=1,
                         label="Frame Skip (analyze every N-th frame)",
-                        info="Higher = faster processing, lower = more thorough"
+                        info="Higher = faster processing, lower = more thorough",
+                        visible=temporal_model is None,
                     )
                     vid_threshold = gr.Slider(
                         minimum=0.1, maximum=0.9, value=0.5, step=0.05,
@@ -401,16 +623,30 @@ with gr.Blocks(
                     vid_tta = gr.Checkbox(
                         value=False,
                         label="Test-Time Augmentation (TTA)",
-                        info="More accurate but slower (~2x per frame)"
+                        info="More accurate but slower (~2x per frame)",
+                        visible=temporal_model is None,
                     )
                     vid_btn = gr.Button("Analyze Video", variant="primary")
                 with gr.Column():
                     vid_result = gr.Textbox(label="Analysis Summary", lines=14)
                     vid_output = gr.Video(label="Annotated Output Video", format="mp4")
 
+            # Toggle visibility of frame-by-frame controls based on temporal checkbox
+            def toggle_temporal(use_temporal):
+                return (
+                    gr.update(visible=not use_temporal),  # vid_skip
+                    gr.update(visible=not use_temporal),  # vid_tta
+                )
+
+            vid_temporal.change(
+                fn=toggle_temporal,
+                inputs=[vid_temporal],
+                outputs=[vid_skip, vid_tta],
+            )
+
             vid_btn.click(
-                fn=predict_video,
-                inputs=[vid_input, vid_skip, vid_threshold, vid_tta],
+                fn=predict_video_router,
+                inputs=[vid_input, vid_skip, vid_threshold, vid_tta, vid_temporal],
                 outputs=[vid_result, vid_output],
             )
 

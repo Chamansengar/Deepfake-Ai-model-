@@ -1,24 +1,31 @@
 """
-Training script for fine-tuning InceptionResnetV1 on deepfake detection.
+Training script for the temporal deepfake detection model.
+
+Fine-tunes the Transformer/LSTM temporal head on video frame sequences
+while keeping the InceptionResnetV1 backbone frozen.
 
 Usage:
-    python train.py --train_dir ./data/train --val_dir ./data/val --epochs 20
+    python train_video.py \
+        --train_dir ./data/video_frames/train \
+        --val_dir ./data/video_frames/val \
+        --epochs 30 \
+        --seq_len 16 \
+        --temporal_head transformer
 
-Expected data layout:
-    data/
+Expected data layout (created by preprocess_videos.py):
+    data/video_frames/
         train/
-            real/   (images)
-            fake/   (images)
+            real/
+                video001/  (frame_0000.jpg, frame_0001.jpg, ...)
+                video002/
+            fake/
+                video001/
+                video002/
         val/
-            real/   (images)
-            fake/   (images)
-
-The script will:
-    1. Load InceptionResnetV1 pretrained on VGGFace2
-    2. Freeze early layers, unfreeze last blocks + classifier
-    3. Train with BCEWithLogitsLoss + class-balanced sampling
-    4. Track AUC, accuracy, precision, recall on validation set
-    5. Save the best checkpoint (by val AUC) to checkpoints/
+            real/
+                ...
+            fake/
+                ...
 """
 
 import os
@@ -30,54 +37,11 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from facenet_pytorch import InceptionResnetV1
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score
 import numpy as np
 
-from dataset import create_dataloaders
-
-
-# ============================================================
-# Model setup with selective unfreezing
-# ============================================================
-
-def build_model(device='cpu', unfreeze_blocks=('block8', 'last_linear', 'last_bn', 'logits')):
-    """
-    Load InceptionResnetV1 pretrained on VGGFace2 and selectively unfreeze
-    the last few blocks for fine-tuning on deepfake detection.
-
-    Args:
-        device: Target device.
-        unfreeze_blocks: Tuple of module name prefixes to unfreeze.
-
-    Returns:
-        model on the specified device.
-    """
-    model = InceptionResnetV1(
-        pretrained='vggface2',
-        classify=True,
-        num_classes=1,
-        device=device,
-    )
-
-    # Freeze everything first
-    for param in model.parameters():
-        param.requires_grad = False
-
-    # Selectively unfreeze
-    unfrozen_params = 0
-    total_params = 0
-    for name, param in model.named_parameters():
-        total_params += param.numel()
-        if any(name.startswith(block) for block in unfreeze_blocks):
-            param.requires_grad = True
-            unfrozen_params += param.numel()
-
-    print(f"[Model] Total parameters:    {total_params:,}")
-    print(f"[Model] Trainable parameters: {unfrozen_params:,} "
-          f"({unfrozen_params / total_params * 100:.1f}%)")
-
-    return model.to(device)
+from video_dataset import create_video_dataloaders
+from temporal_model import TemporalDeepfakeModel
 
 
 # ============================================================
@@ -85,29 +49,33 @@ def build_model(device='cpu', unfreeze_blocks=('block8', 'last_linear', 'last_bn
 # ============================================================
 
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
-    """Train for one epoch, return average loss."""
+    """Train the temporal model for one epoch. Returns average loss."""
     model.train()
     running_loss = 0.0
     num_batches = 0
 
-    for batch_idx, (images, labels) in enumerate(loader):
-        images = images.to(device, non_blocking=True)
+    for batch_idx, (frames, labels) in enumerate(loader):
+        # frames: (B, T, 3, H, W), labels: (B,)
+        frames = frames.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        outputs = model(images).squeeze(-1)  # (B,)
+        outputs = model(frames).squeeze(-1)  # (B,)
         loss = criterion(outputs, labels)
         loss.backward()
 
-        # Gradient clipping to stabilize training
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            max_norm=1.0,
+        )
 
         optimizer.step()
 
         running_loss += loss.item()
         num_batches += 1
 
-        if (batch_idx + 1) % 20 == 0:
+        if (batch_idx + 1) % 10 == 0:
             avg = running_loss / num_batches
             print(f"  [Epoch {epoch}] Batch {batch_idx + 1}/{len(loader)} — Loss: {avg:.4f}")
 
@@ -120,20 +88,18 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
 
 @torch.no_grad()
 def validate(model, loader, criterion, device):
-    """
-    Validate the model. Returns dict with loss, accuracy, AUC, precision, recall.
-    """
+    """Validate the temporal model. Returns dict of metrics."""
     model.eval()
     running_loss = 0.0
     all_labels = []
     all_probs = []
     num_batches = 0
 
-    for images, labels in loader:
-        images = images.to(device, non_blocking=True)
+    for frames, labels in loader:
+        frames = frames.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        outputs = model(images).squeeze(-1)
+        outputs = model(frames).squeeze(-1)
         loss = criterion(outputs, labels)
 
         running_loss += loss.item()
@@ -149,7 +115,6 @@ def validate(model, loader, criterion, device):
 
     avg_loss = running_loss / max(num_batches, 1)
 
-    # Handle edge case where only one class is present in batch
     try:
         auc = roc_auc_score(all_labels, all_probs)
     except ValueError:
@@ -172,31 +137,47 @@ def validate(model, loader, criterion, device):
 def main(args):
     # Device
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    print(f"[Train] Using device: {device}")
+    print(f"[TrainVideo] Using device: {device}")
 
     # Checkpoint directory
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Data loaders
-    print(f"[Train] Loading data...")
-    train_loader, val_loader = create_dataloaders(
+    print(f"[TrainVideo] Loading video data...")
+    train_loader, val_loader = create_video_dataloaders(
         train_dir=args.train_dir,
         val_dir=args.val_dir,
+        seq_len=args.seq_len,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         image_size=args.image_size,
-        use_mtcnn=args.use_mtcnn,
     )
 
     # Model
-    print(f"[Train] Building model...")
-    model = build_model(device=device)
+    print(f"[TrainVideo] Building temporal model...")
+    backbone_weights = args.backbone_weights
+    if backbone_weights is None:
+        # Try to use existing fine-tuned checkpoint as backbone
+        default_ckpt = os.path.join(os.path.dirname(__file__), 'checkpoints', 'best_model.pth')
+        if os.path.isfile(default_ckpt):
+            backbone_weights = default_ckpt
+            print(f"[TrainVideo] Using existing fine-tuned backbone: {default_ckpt}")
 
-    # Loss & Optimizer
+    model = TemporalDeepfakeModel(
+        temporal_head=args.temporal_head,
+        backbone_weights=backbone_weights,
+        freeze_backbone=not args.unfreeze_backbone,
+        device=device,
+        seq_len=args.seq_len,
+    )
+    model = model.to(device)
+
+    # Loss & Optimizer — only optimize trainable parameters
     criterion = nn.BCEWithLogitsLoss()
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        trainable_params,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -222,12 +203,15 @@ def main(args):
             print(f"[Train] Checkpoint not found at {args.resume}, starting from scratch.")
 
     print(f"\n{'=' * 60}")
-    print(f"Starting training for {args.epochs} epochs")
-    print(f"  Batch size:     {args.batch_size}")
-    print(f"  Learning rate:  {args.lr}")
-    print(f"  Weight decay:   {args.weight_decay}")
-    print(f"  Early stopping: {args.patience} epochs")
-    print(f"  Checkpoints:    {ckpt_dir}")
+    print(f"Starting TEMPORAL model training for {args.epochs} epochs")
+    print(f"  Temporal head:   {args.temporal_head}")
+    print(f"  Sequence length: {args.seq_len}")
+    print(f"  Batch size:      {args.batch_size}")
+    print(f"  Learning rate:   {args.lr}")
+    print(f"  Weight decay:    {args.weight_decay}")
+    print(f"  Backbone frozen: {not args.unfreeze_backbone}")
+    print(f"  Early stopping:  {args.patience} epochs")
+    print(f"  Checkpoints:     {ckpt_dir}")
     print(f"{'=' * 60}\n")
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -262,15 +246,17 @@ def main(args):
             best_auc = val_metrics['auc']
             patience_counter = 0
 
-            best_path = ckpt_dir / 'best_model.pth'
+            best_path = ckpt_dir / 'best_temporal_model.pth'
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_auc': best_auc,
                 'val_metrics': val_metrics,
+                'temporal_head': args.temporal_head,
+                'seq_len': args.seq_len,
             }, best_path)
-            print(f"  ✓ New best model saved (AUC: {best_auc:.4f}) → {best_path}")
+            print(f"  ✓ New best temporal model saved (AUC: {best_auc:.4f}) → {best_path}")
         else:
             patience_counter += 1
             print(f"  No improvement ({patience_counter}/{args.patience})")
@@ -280,23 +266,25 @@ def main(args):
             print(f"\n[Early Stopping] No improvement for {args.patience} epochs. Stopping.")
             break
 
-        # Save periodic checkpoint
+        # Periodic checkpoint
         if epoch % args.save_every == 0:
-            periodic_path = ckpt_dir / f'checkpoint_epoch_{epoch}.pth'
+            periodic_path = ckpt_dir / f'temporal_checkpoint_epoch_{epoch}.pth'
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_auc': best_auc,
                 'val_metrics': val_metrics,
+                'temporal_head': args.temporal_head,
+                'seq_len': args.seq_len,
             }, periodic_path)
             print(f"  Periodic checkpoint saved → {periodic_path}")
 
     # Final summary
     print(f"\n{'=' * 60}")
-    print(f"Training complete!")
+    print(f"Temporal Training Complete!")
     print(f"  Best validation AUC: {best_auc:.4f}")
-    print(f"  Best checkpoint:     {ckpt_dir / 'best_model.pth'}")
+    print(f"  Best checkpoint:     {ckpt_dir / 'best_temporal_model.pth'}")
     print(f"{'=' * 60}")
 
 
@@ -305,29 +293,40 @@ def main(args):
 # ============================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Fine-tune InceptionResnetV1 for deepfake detection')
+    parser = argparse.ArgumentParser(
+        description='Train temporal deepfake detection model on video frame sequences'
+    )
 
     # Data
     parser.add_argument('--train_dir', type=str, required=True,
-                        help='Path to training data (containing real/ and fake/ subdirs)')
+                        help='Path to training video frames (containing real/ and fake/ subdirs)')
     parser.add_argument('--val_dir', type=str, required=True,
-                        help='Path to validation data (containing real/ and fake/ subdirs)')
+                        help='Path to validation video frames (containing real/ and fake/ subdirs)')
     parser.add_argument('--image_size', type=int, default=256,
-                        help='Input image size (default: 256)')
-    parser.add_argument('--use_mtcnn', action='store_true',
-                        help='Run MTCNN face detection during data loading (use if images are not pre-cropped)')
+                        help='Input frame size (default: 256)')
+    parser.add_argument('--seq_len', type=int, default=16,
+                        help='Number of frames per video sequence (default: 16)')
+
+    # Model
+    parser.add_argument('--temporal_head', type=str, default='transformer',
+                        choices=['transformer', 'lstm'],
+                        help='Temporal head architecture (default: transformer)')
+    parser.add_argument('--backbone_weights', type=str, default=None,
+                        help='Path to fine-tuned backbone checkpoint (default: auto-detect)')
+    parser.add_argument('--unfreeze_backbone', action='store_true',
+                        help='Unfreeze backbone for end-to-end fine-tuning (uses more memory)')
 
     # Training
-    parser.add_argument('--epochs', type=int, default=20,
-                        help='Number of training epochs (default: 20)')
-    parser.add_argument('--batch_size', type=int, default=32,
-                        help='Batch size (default: 32)')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Initial learning rate (default: 1e-4)')
+    parser.add_argument('--epochs', type=int, default=30,
+                        help='Number of training epochs (default: 30)')
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Batch size (default: 8, lower than image training due to memory)')
+    parser.add_argument('--lr', type=float, default=5e-4,
+                        help='Initial learning rate (default: 5e-4)')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                         help='Weight decay for AdamW (default: 1e-4)')
-    parser.add_argument('--patience', type=int, default=5,
-                        help='Early stopping patience in epochs (default: 5)')
+    parser.add_argument('--patience', type=int, default=7,
+                        help='Early stopping patience in epochs (default: 7)')
 
     # Checkpoints
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',

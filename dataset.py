@@ -89,8 +89,8 @@ def get_train_transforms(image_size=256):
         RandomGaussianBlur(p=0.3),
         JPEGCompression(quality_range=(30, 95)),
         RandomDownscaleUpscale(scale_range=(0.5, 0.9)),
-        transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),  # small cutout
         transforms.ToTensor(),  # [0, 1]
+        transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),  # small cutout expects tensor
     ])
 
 
