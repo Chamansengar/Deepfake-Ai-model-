@@ -69,31 +69,41 @@ resnet.eval()  # Set model to evaluation mode
 # 3b. Initialize Temporal Model (if checkpoint exists)
 # ============================================================
 TEMPORAL_CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), 'checkpoints', 'best_temporal_model.pth')
+TEMPORAL_CLIPS_CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), 'checkpoints', 'best_temporal_clips_model.pth')
 temporal_model = None
 temporal_seq_len = 16  # default
 
+# Check for frame-based temporal checkpoint first, then video-clips pipeline checkpoint
+_temporal_ckpt_path = None
 if os.path.isfile(TEMPORAL_CHECKPOINT_PATH):
-    print(f"Loading temporal model checkpoint: {TEMPORAL_CHECKPOINT_PATH}")
+    _temporal_ckpt_path = TEMPORAL_CHECKPOINT_PATH
+elif os.path.isfile(TEMPORAL_CLIPS_CHECKPOINT_PATH):
+    _temporal_ckpt_path = TEMPORAL_CLIPS_CHECKPOINT_PATH
+    print(f"Using video clips pipeline temporal model: {TEMPORAL_CLIPS_CHECKPOINT_PATH}")
+
+if _temporal_ckpt_path is not None:
+    print(f"Loading temporal model checkpoint: {_temporal_ckpt_path}")
     try:
         # Peek at checkpoint to get config
-        _ckpt = torch.load(TEMPORAL_CHECKPOINT_PATH, map_location=device, weights_only=True)
+        _ckpt = torch.load(_temporal_ckpt_path, map_location=device, weights_only=True)
         _temporal_head = _ckpt.get('temporal_head', 'transformer')
         temporal_seq_len = _ckpt.get('seq_len', 16)
 
         temporal_model = load_temporal_model(
-            checkpoint_path=TEMPORAL_CHECKPOINT_PATH,
+            checkpoint_path=_temporal_ckpt_path,
             temporal_head=_temporal_head,
             device=device,
             seq_len=temporal_seq_len,
         )
         temporal_model.to(device)
-        print(f"  Temporal model ready (head={_temporal_head}, seq_len={temporal_seq_len})")
+        _pipeline = _ckpt.get('pipeline', 'video_frames')
+        print(f"  Temporal model ready (head={_temporal_head}, seq_len={temporal_seq_len}, pipeline={_pipeline})")
     except Exception as e:
         print(f"WARNING: Failed to load temporal model: {e}")
         temporal_model = None
 else:
-    print(f"No temporal model found at '{TEMPORAL_CHECKPOINT_PATH}'.")
-    print("  Run 'python train_video.py' to train the temporal model.")
+    print(f"No temporal model found.")
+    print("  Train with 'python train_video.py' (frame-based) or 'python train_video_clips.py' (video clips).")
 
 # ============================================================
 # 4. Pre-instantiate GradCAM ONCE (was re-created per call before)
