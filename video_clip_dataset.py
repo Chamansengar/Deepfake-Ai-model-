@@ -371,8 +371,11 @@ class VideoClipDataset(Dataset):
             frame_tensors = [torch.zeros(3, 256, 256) for _ in range(self.seq_len)]
 
         # Pad to seq_len if we still don't have enough
+        n_existing = len(frame_tensors)
+        i = n_existing
         while len(frame_tensors) < self.seq_len:
-            frame_tensors.append(frame_tensors[len(frame_tensors) % len(frame_tensors)])
+            frame_tensors.append(frame_tensors[i % n_existing])
+            i += 1
         frame_tensors = frame_tensors[:self.seq_len]
 
         # Stack: (seq_len, 3, H, W)
@@ -576,6 +579,7 @@ def create_video_clip_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -583,6 +587,7 @@ def create_video_clip_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
 
     return train_loader, val_loader

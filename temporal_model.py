@@ -13,6 +13,7 @@ Architecture:
 """
 
 import math
+import os
 import torch
 import torch.nn as nn
 from facenet_pytorch import InceptionResnetV1
@@ -348,10 +349,10 @@ def load_temporal_model(
         seq_len=seq_len,
     )
 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)  # noqa: S614
     model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
     model.to(device)
+    model.eval()
 
     print(f"[TemporalModel] Loaded checkpoint from '{checkpoint_path}'")
     print(f"  Epoch: {checkpoint.get('epoch', '?')}")
@@ -360,7 +361,3 @@ def load_temporal_model(
     print(f"  Val Acc: {val_metrics.get('accuracy', '?')}")
 
     return model
-
-
-# Need os for file path checks
-import os

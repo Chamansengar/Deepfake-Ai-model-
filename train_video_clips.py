@@ -48,7 +48,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score
 import numpy as np
 
@@ -60,7 +60,8 @@ from temporal_model import TemporalDeepfakeModel
 # Training loop for one epoch
 # ============================================================
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=False, scaler=None):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch,
+                    use_amp=False, scaler=None, trainable_params=None):
     """Train the temporal model for one epoch on video clips. Returns average loss."""
     model.train()
     running_loss = 0.0
@@ -74,25 +75,19 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
         optimizer.zero_grad()
 
         if use_amp and scaler is not None:
-            with autocast():
+            with autocast('cuda'):
                 outputs = model(frames).squeeze(-1)  # (B,)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                filter(lambda p: p.requires_grad, model.parameters()),
-                max_norm=1.0,
-            )
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             outputs = model(frames).squeeze(-1)  # (B,)
             loss = criterion(outputs, labels)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                filter(lambda p: p.requires_grad, model.parameters()),
-                max_norm=1.0,
-            )
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
         running_loss += loss.item()
@@ -216,7 +211,7 @@ def main(args):
 
     # Mixed precision
     use_amp = args.amp and device.startswith('cuda')
-    scaler = GradScaler() if use_amp else None
+    scaler = GradScaler('cuda') if use_amp else None
     if use_amp:
         print(f"[TrainVideoClips] Using automatic mixed precision (AMP)")
 
@@ -228,7 +223,7 @@ def main(args):
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"[TrainVideoClips] Resuming from checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
             start_epoch = checkpoint['epoch'] + 1
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -265,7 +260,7 @@ def main(args):
         # Train
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch,
-            use_amp=use_amp, scaler=scaler,
+            use_amp=use_amp, scaler=scaler, trainable_params=trainable_params,
         )
 
         # Validate
