@@ -11,6 +11,7 @@ from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from temporal_model import TemporalDeepfakeModel, load_temporal_model
+from audio_model import get_audio_detector
 
 # ============================================================
 # 1. Initialize Device (Use GPU if available)
@@ -564,17 +565,56 @@ def predict_video_router(input_video, frame_skip=5, threshold=0.5, use_tta=False
         return predict_video(input_video, frame_skip=frame_skip, threshold=threshold, use_tta=use_tta)
 
 
+
+# ============================================================
+# 6d. Voice / Audio Deepfake Prediction
+# ============================================================
+def predict_audio_deepfake(audio_input, threshold=0.5, chunk_duration=3.5):
+    """
+    Analyzes an audio file or microphone recording for deepfake/synthetic voice traces.
+    Uses Wav2Vec2 transformer embeddings + acoustic forensic metrics (F0 jitter,
+    high-frequency vocoder cutoff, silence continuity).
+    """
+    if audio_input is None:
+        return (
+            "No audio provided. Please upload an audio file or record speech using the microphone.",
+            None,
+            {"Synthetic / Fake Voice": 0.0, "Authentic / Real Voice": 0.0}
+        )
+    
+    try:
+        detector = get_audio_detector()
+        result = detector.predict(
+            audio_input,
+            chunk_duration=chunk_duration,
+            threshold=threshold
+        )
+        
+        prob_dict = {
+            "Synthetic / Fake Voice": result["fake_prob"],
+            "Authentic / Real Voice": result["real_prob"]
+        }
+        
+        return result["summary_text"], result["plot_image_path"], prob_dict
+    except Exception as e:
+        error_msg = f"Error during voice deepfake analysis: {str(e)}"
+        print(error_msg)
+        return error_msg, None, {}
+
+
 # ============================================================
 # 7. Build the Gradio Interface with Tabs
 # ============================================================
 with gr.Blocks(
-    title="DeepFake Detection Engine",
+    title="Multi-Modal DeepFake Detection Engine",
 ) as app:
     gr.Markdown(
         """
-        # DeepFake Detection Engine
-        Upload an **image** or **video** containing faces. The system uses **MTCNN** for face extraction
-        and **InceptionResnetV1** for classification, with **Grad-CAM** heatmaps for explainability.
+        # Multi-Modal DeepFake Detection Engine
+        Detect AI-generated manipulations across **Image**, **Video**, and **Voice / Audio**:
+        - **Visual**: **MTCNN** face extraction + **InceptionResnetV1** classification with **Grad-CAM** explainability.
+        - **Video Dynamics**: Temporal sequence analysis modeling cross-frame biological inconsistencies.
+        - **Acoustic / Voice**: **Wav2Vec2** self-supervised speech transformer paired with **multi-domain acoustic forensics** (F0 pitch micro-jitter, vocoder spectral cutoff, and temporal segment scanning).
         """
     )
 
@@ -658,6 +698,37 @@ with gr.Blocks(
                 fn=predict_video_router,
                 inputs=[vid_input, vid_skip, vid_threshold, vid_tta, vid_temporal],
                 outputs=[vid_result, vid_output],
+            )
+
+        # ---- Voice / Audio Tab ----
+        with gr.TabItem("Voice Deepfake Detection"):
+            with gr.Row():
+                with gr.Column():
+                    audio_input = gr.Audio(
+                        sources=["upload", "microphone"],
+                        type="filepath",
+                        label="Upload Audio or Record Voice (.wav, .mp3, .m4a, .flac, .ogg)"
+                    )
+                    audio_threshold = gr.Slider(
+                        minimum=0.1, maximum=0.9, value=0.5, step=0.05,
+                        label="Decision Threshold",
+                        info="Lower = stricter detection of subtle AI voice clones, Higher = conservative"
+                    )
+                    audio_chunk_len = gr.Slider(
+                        minimum=1.5, maximum=6.0, value=3.5, step=0.5,
+                        label="Temporal Window Chunk (seconds)",
+                        info="Overlapping window size used to scan and detect spliced synthetic speech segments"
+                    )
+                    audio_btn = gr.Button("Analyze Voice Authenticity", variant="primary")
+                with gr.Column():
+                    audio_label = gr.Label(label="Detection Probabilities", num_top_classes=2)
+                    audio_result = gr.Textbox(label="Forensic Analysis Summary", lines=14)
+                    audio_plot = gr.Image(label="Mel-Spectrogram & Pitch Jitter Timeline", type="filepath")
+
+            audio_btn.click(
+                fn=predict_audio_deepfake,
+                inputs=[audio_input, audio_threshold, audio_chunk_len],
+                outputs=[audio_result, audio_plot, audio_label],
             )
 
 # ============================================================

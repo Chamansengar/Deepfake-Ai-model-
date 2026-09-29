@@ -9,9 +9,11 @@ A deep learning-based deepfake detection system that analyses **videos** using a
 - 🖼️ **Image Detection** — Analyse a single photo for deepfake manipulation
 - 🎬 **Video Detection** — Frame-by-frame analysis with bounding box annotations
 - 🕐 **Temporal Video Analysis** — Sequence-aware detection using Transformer or LSTM across multiple frames
+- 🎙️ **Voice & Audio Deepfake Detection** — Detect AI voice clones and synthetic speech using Wav2Vec2 transformers & multi-domain acoustic forensics
 - 🔥 **Grad-CAM Explainability** — Heatmap overlays showing what the model focuses on
+- 📊 **Audio Forensic Explainability** — Mel-Spectrogram (0-8kHz), F0 pitch micro-jitter tracking, and temporal segment risk overlay
 - 🔄 **Test-Time Augmentation (TTA)** — Optional horizontal flip averaging for improved accuracy
-- ⚙️ **Adjustable Thresholds** — Fine-tune sensitivity for real/fake classification
+- ⚙️ **Adjustable Thresholds & Chunk Windows** — Fine-tune sensitivity and window duration
 - 🚀 **GPU Acceleration** — Automatic CUDA + AMP support when available
 - ⚡ **Face Caching** — Extracted faces cached to disk for faster subsequent epochs
 
@@ -19,6 +21,7 @@ A deep learning-based deepfake detection system that analyses **videos** using a
 
 ## 🏗️ Architecture
 
+### 1. Visual & Video Detection
 ```
 Image/Video
     └─► MTCNN (Face Detection)
@@ -30,13 +33,19 @@ Image/Video
                                               └─► Video-level prediction (Real / Fake)
 ```
 
-**Temporal Model pipeline:**
+### 2. Voice & Audio Deepfake Detection
 ```
-Raw video (.mp4 / .avi)
-    → MTCNN face extraction per frame
-    → InceptionResnetV1 per frame → (B, T, 512) embeddings
-    → Temporal Head (Transformer / LSTM)
-    → Binary classification (Real / Fake)
+Voice Audio (.wav / .mp3 / .m4a / microphone)
+    └─► Resample (16kHz mono) & Peak Normalization
+            ├─► Wav2Vec2 Speech Transformer (Sliding Temporal Window)
+            │         └─► Segment-level logits & Fake/Real probabilities
+            └─► Multi-Domain Acoustic Forensic Engine
+                      ├─► F0 Pitch Trajectory & Micro-Jitter (biomechanical instability)
+                      ├─► High-Frequency Vocoder Energy Cutoff (>6.5kHz vs Total)
+                      ├─► Spectral Centroid & Spectral Flatness
+                      └─► Silence / Ambient Noise Continuity
+            ▼
+    Dual-Panel Explainability Plot + Forensic Analysis Report + Confidence Breakdown
 ```
 
 ---
@@ -45,7 +54,8 @@ Raw video (.mp4 / .avi)
 
 ```
 Ai model/
-├── app.py                       # Main Gradio web app
+├── app.py                       # Main Gradio web app (Image, Video & Voice tabs)
+├── audio_model.py               # AudioDeepfakeDetector (Wav2Vec2 + Forensics + Spectrograms)
 ├── temporal_model.py            # TemporalDeepfakeModel (Transformer + LSTM heads)
 ├── train_video_clips.py         # Training script — end-to-end from raw video clips
 ├── dataset.py                   # Augmentation transforms (reused by clip dataset)
